@@ -1,0 +1,287 @@
+<?php
+// index.php
+require_once 'config/database.php';
+
+$selected_date = $_GET['date'] ?? date('Y-m-d');
+
+// --- إحصائيات علوية (تعتمد على التاريخ المحدد) ---
+
+// 1. المشتريات
+$purchases_stmt = $pdo->prepare("SELECT COUNT(*) as total_cars, SUM(gross_weight) as total_weight FROM purchases WHERE purchase_date = ?");
+$purchases_stmt->execute([$selected_date]);
+$purchases_stats = $purchases_stmt->fetch();
+$total_cars = $purchases_stats['total_cars'] ?? 0;
+$total_purchases_weight = ($purchases_stats['total_weight'] ?? 0) / 1000; // بالطن
+
+// 2. إيراد الغربلة التجارية
+$sifting_stmt = $pdo->prepare("SELECT SUM(total_income) as total_income FROM sifting_operations WHERE type = 'external' AND operation_date = ?");
+$sifting_stmt->execute([$selected_date]);
+$total_income = $sifting_stmt->fetch()['total_income'] ?? 0;
+
+// 3. المصروفات الشاملة للتاريخ
+$expenses_stmt = $pdo->prepare("SELECT SUM(amount) as total_expenses FROM expenses WHERE expense_date = ?");
+$expenses_stmt->execute([$selected_date]);
+$total_expenses = $expenses_stmt->fetch()['total_expenses'] ?? 0;
+
+// 4. الرصيد / حركة الخزينة للتاريخ
+$payments_out_stmt = $pdo->prepare("SELECT SUM(amount) as pout FROM payments WHERE transaction_type = 'out' AND payment_date = ?");
+$payments_out_stmt->execute([$selected_date]);
+$pout = $payments_out_stmt->fetch()['pout'] ?? 0;
+
+$payments_in_stmt = $pdo->prepare("SELECT SUM(amount) as pin FROM payments WHERE transaction_type = 'in' AND payment_date = ?");
+$payments_in_stmt->execute([$selected_date]);
+$pin = $payments_in_stmt->fetch()['pin'] ?? 0;
+
+// صافي الحركة النقدية = المقبوضات - (المنصرفات + المصاريف النثرية)
+$net_cashflow = $pin - ($pout + $total_expenses);
+
+// --- مخزون وديون (عام، لا يتأثر بالتاريخ) ---
+// المديونيات
+$debt_stmt = $pdo->query("SELECT COUNT(*) as debt_count FROM beneficiaries WHERE current_balance > 0");
+$debt_count = $debt_stmt->fetch()['debt_count'] ?? 0;
+
+// المخزون الفعلي
+$inv_stmt = $pdo->query("SELECT c.name, i.raw_quantity, i.sifted_quantity FROM inventory i JOIN crops c ON i.crop_id = c.id WHERE (i.raw_quantity > 0 OR i.sifted_quantity > 0) LIMIT 4");
+$inventory_data = $inv_stmt->fetchAll();
+
+
+// --- أحدث الحركات (تعتمد على التاريخ) ---
+$recent_purchases_stmt = $pdo->prepare("
+    SELECT p.*, b.name as supplier_name, c.name as crop_name 
+    FROM purchases p 
+    JOIN beneficiaries b ON p.beneficiary_id = b.id 
+    JOIN crops c ON p.crop_id = c.id 
+    WHERE p.purchase_date = ? 
+    ORDER BY p.id DESC LIMIT 10
+");
+$recent_purchases_stmt->execute([$selected_date]);
+$recent_purchases = $recent_purchases_stmt->fetchAll();
+
+
+// تفصيل النثريات للتاريخ
+$cat_expenses_stmt = $pdo->prepare("SELECT category, SUM(amount) as total FROM expenses WHERE expense_date = ? GROUP BY category");
+$cat_expenses_stmt->execute([$selected_date]);
+$cat_expenses_raw = $cat_expenses_stmt->fetchAll(PDO::FETCH_KEY_PAIR);
+$cats = ['labor' => 0, 'fuel' => 0, 'maintenance' => 0, 'other' => 0];
+foreach($cat_expenses_raw as $cat => $val) { $cats[$cat] = $val; }
+
+require_once 'includes/header.php';
+?>
+
+<!-- Add Print Style formatting -->
+<style>
+    @media print {
+        @page { size: A4 landscape; margin: 1cm; }
+        body { background: white; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        .sidebar, header, .no-print { display: none !important; }
+        .main-content { overflow: visible !important; height: auto !important; padding: 0 !important; }
+        .shadow-sm, .shadow-md { box-shadow: none !important; border: 1px solid #e2e8f0 !important; }
+        /* Add a report title visibly only when printing */
+        .print-header { display: block !important; text-align: center; margin-bottom: 20px; font-weight: bold; font-size: 24px; color: #1e293b; border-bottom: 2px solid #cbd5e1; padding-bottom: 10px; }
+    }
+    .print-header { display: none; }
+</style>
+
+<div class="print-header">نظام غربال - تقرير حالة المنشأة ليوم (<?= htmlspecialchars($selected_date) ?>)</div>
+
+<!-- شريط الخيارات والطباعة -->
+<div class="flex flex-col lg:flex-row justify-between items-center mb-8 gap-4 no-print">
+    <div>
+        <p class="text-slate-500 font-bold">نظرة عامة على أداء الغربال والمخازن</p>
+    </div>
+    <div class="flex flex-wrap items-center gap-3 bg-white p-2 rounded-2xl shadow-sm border border-slate-100">
+        <!-- فلتر التاريخ -->
+        <form id="dateForm" class="flex items-center m-0" method="GET" action="index.php">
+            <input type="date" name="date" id="reportDate" class="p-2 border-none outline-none text-sm font-bold text-slate-700 bg-slate-50 rounded-lg" value="<?= htmlspecialchars($selected_date) ?>" onchange="document.getElementById('dateForm').submit()">
+        </form>
+        
+        <select id="exportType" class="p-2 border-r text-sm font-bold text-indigo-600 outline-none bg-transparent">
+            <option value="daily">تقرير يومي</option>
+            <option value="monthly">تقرير شهري</option>
+        </select>
+        
+        <button onclick="exportExcel()" class="bg-emerald-500 text-white px-4 py-2 rounded-xl font-bold hover:bg-emerald-600 transition flex items-center gap-2">
+            <i class="fas fa-file-excel"></i> إكسل
+        </button>
+        <button onclick="window.print()" class="bg-indigo-600 text-white px-4 py-2 rounded-xl font-bold hover:bg-indigo-700 transition flex items-center gap-2">
+            <i class="fas fa-print"></i> طباعة
+        </button>
+    </div>
+</div>
+
+<!-- بطاقات الإحصائيات (KPIs) -->
+<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+    <div class="bg-white rounded-3xl p-6 shadow-sm border-b-4 border-blue-500">
+        <div class="flex justify-between items-start">
+            <div>
+                <p class="text-slate-400 text-xs font-bold uppercase">إجمالي المشتريات المستلمة</p>
+                <h3 class="text-2xl font-black text-slate-800 mt-1"><?= $total_cars ?> <span class="text-sm font-normal">عربة</span></h3>
+            </div>
+            <div class="text-blue-500 bg-blue-50 p-3 rounded-2xl"><i class="fas fa-truck-moving"></i></div>
+        </div>
+        <div class="mt-4 text-xs text-slate-500">بوزن إجمالي: <span class="font-bold text-blue-600"><?= number_format($total_purchases_weight, 2) ?> طن</span></div>
+    </div>
+
+    <div class="bg-white rounded-3xl p-6 shadow-sm border-b-4 border-emerald-500">
+        <div class="flex justify-between items-start">
+            <div>
+                <p class="text-slate-400 text-xs font-bold uppercase">إيراد الغربلة التجارية</p>
+                <h3 class="text-2xl font-black text-emerald-600 mt-1"><?= number_format($total_income) ?> <span class="text-sm font-normal">SDG</span></h3>
+            </div>
+            <div class="text-emerald-500 bg-emerald-50 p-3 rounded-2xl"><i class="fas fa-chart-line"></i></div>
+        </div>
+        <div class="mt-4 text-xs text-emerald-500">من غربلة للغير (العملاء)</div>
+    </div>
+
+    <div class="bg-white rounded-3xl p-6 shadow-sm border-b-4 border-rose-500">
+        <div class="flex justify-between items-start">
+            <div>
+                <p class="text-slate-400 text-xs font-bold uppercase">إجمالي المصروفات والنثريات</p>
+                <h3 class="text-2xl font-black text-rose-600 mt-1"><?= number_format($total_expenses) ?> <span class="text-sm font-normal">SDG</span></h3>
+            </div>
+            <div class="text-rose-500 bg-rose-50 p-3 rounded-2xl"><i class="fas fa-wallet"></i></div>
+        </div>
+        <div class="mt-4 text-xs text-rose-500">مجموع التشغيل والنثريات</div>
+    </div>
+
+    <div class="bg-white rounded-3xl p-6 shadow-sm border-b-4 border-indigo-500">
+        <div class="flex justify-between items-start">
+            <div>
+                <p class="text-slate-400 text-xs font-bold uppercase">صافي الحركة النقدية</p>
+                <h3 class="text-2xl font-black <?= $net_cashflow >= 0 ? 'text-indigo-600' : 'text-rose-600' ?> mt-1 font-mono"><?= number_format($net_cashflow) ?></h3>
+            </div>
+            <div class="<?= $net_cashflow >= 0 ? 'text-indigo-500 bg-indigo-50' : 'text-rose-500 bg-rose-50' ?> p-3 rounded-2xl"><i class="fas max-w fa-coins"></i></div>
+        </div>
+        <div class="mt-4 text-xs text-slate-500">السيولة (مقبوضات - منصرفات)</div>
+    </div>
+</div>
+
+<!-- القسم السفلي: المخزون، العربات، والديون -->
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-8 pb-10">
+    
+    <!-- عمود جانبي (مخزون وديون) -->
+    <div class="lg:col-span-1 space-y-6 flex flex-col">
+        <!-- حالة المخزون السريعة -->
+        <div class="bg-white rounded-3xl p-6 shadow-sm border border-slate-100 flex-1">
+            <h3 class="text-lg font-bold text-slate-800 mb-4 border-b pb-2"><i class="fas fa-box text-indigo-500 ml-2"></i> حالة المخزون اللحظية</h3>
+            <div class="space-y-4">
+                <?php if(empty($inventory_data)): ?>
+                    <div class="text-center text-slate-400 text-sm mt-8">لا يوجد محاصيل بالمخزن حالياً.</div>
+                <?php else: ?>
+                    <?php foreach($inventory_data as $inv): 
+                        $total = $inv['raw_quantity'] + $inv['sifted_quantity'];
+                        $sifted_percent = ($total > 0) ? ($inv['sifted_quantity'] / $total) * 100 : 0;
+                    ?>
+                    <div class="p-3 bg-slate-50 rounded-2xl border border-slate-100 border-r-4 border-r-blue-400">
+                        <div class="flex justify-between text-sm mb-1">
+                            <span class="font-bold text-slate-700"><?= htmlspecialchars($inv['name']) ?></span>
+                            <span class="text-indigo-600 font-bold"><?= number_format($sifted_percent, 1) ?>% مغربل</span>
+                        </div>
+                        <div class="w-full bg-slate-200 h-2 rounded-full overflow-hidden">
+                            <div class="bg-indigo-500 h-full transition-all duration-500" style="width: <?= $sifted_percent ?>%"></div>
+                        </div>
+                        <div class="flex justify-between text-[11px] mt-2 font-bold text-slate-500">
+                            <span>خام: <?= number_format($inv['raw_quantity'] / 1000, 1) ?> طن</span>
+                            <span>مغربل: <?= number_format($inv['sifted_quantity'] / 1000, 1) ?> طن</span>
+                        </div>
+                    </div>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+            </div>
+            <button onclick="location.href='inventory.php'" class="w-full mt-4 text-xs font-bold text-indigo-600 hover:text-indigo-800 text-left no-print">التفاصيل الكاملة للمخزون &larr;</button>
+        </div>
+
+        <!-- تنبيه المديونيات -->
+        <div class="bg-gradient-to-br from-rose-500 to-rose-600 rounded-3xl p-6 shadow-md text-white mt-auto">
+            <h3 class="text-lg font-bold mb-4 opacity-90 text-center"><i class="fas fa-exclamation-triangle ml-2"></i> تنبيه المديونيات</h3>
+            <div class="text-center">
+                <p class="text-4xl font-black mb-1"><?= $debt_count ?></p>
+                <p class="text-xs opacity-90 bg-white/20 inline-block px-3 py-1 rounded-full">حساب (مورد/عميل) لديه رصيد غير مصفر</p>
+            </div>
+            <button onclick="location.href='beneficiaries.php'" class="w-full mt-6 bg-white/20 hover:bg-white/30 text-white py-3 rounded-xl text-sm font-bold transition shadow-sm border border-white/10 no-print">
+                إدارة وسداد الأرصدة
+            </button>
+        </div>
+    </div>
+
+    <!-- جدول حركة العربات والمصاريف المفصلة -->
+    <div class="lg:col-span-2 space-y-6">
+        <div class="bg-white rounded-3xl p-6 shadow-sm border border-slate-100 min-h-full">
+            <div class="flex justify-between items-center mb-6">
+                <h3 class="text-lg font-bold text-slate-800 flex items-center">
+                    <i class="fas fa-list-check ml-3 text-indigo-500"></i> تفاصيل حركة مشتريات العربات للـتاريخ
+                </h3>
+                <button onclick="location.href='purchases.php'" class="bg-indigo-50 text-indigo-600 px-3 py-1 rounded-lg text-xs font-bold hover:bg-indigo-100 transition no-print">
+                    + تسجيل عربة
+                </button>
+            </div>
+            
+            <div class="overflow-x-auto">
+                <table class="w-full text-right text-sm">
+                    <thead>
+                        <tr class="text-slate-400 border-b border-slate-200">
+                            <th class="pb-3 px-2 font-bold">رقم الحركة</th>
+                            <th class="pb-3 px-2 font-bold">لوحة العربة</th>
+                            <th class="pb-3 px-2 font-bold">المورد</th>
+                            <th class="pb-3 px-2 font-bold">الصنف</th>
+                            <th class="pb-3 px-2 font-bold">الوزن الصافي</th>
+                            <th class="pb-3 px-2 font-bold">الإجمالي (SDG)</th>
+                        </tr>
+                    </thead>
+                    <tbody class="text-slate-700 divide-y divide-slate-50">
+                        <?php if(empty($recent_purchases)): ?>
+                            <tr><td colspan="6" class="py-10 text-center text-slate-400 font-bold bg-slate-50/50">لا توجد عمليات شراء مُسجلة في هذا التاريخ.</td></tr>
+                        <?php else: ?>
+                            <?php foreach($recent_purchases as $rp): ?>
+                            <tr class="hover:bg-slate-50 transition">
+                                <td class="py-3 px-2 font-black text-slate-400 text-xs">#<?= $rp['id'] ?></td>
+                                <td class="py-3 px-2 font-black text-slate-800"><?= htmlspecialchars($rp['truck_number'] ?: 'غير محدد') ?></td>
+                                <td class="py-3 px-2 font-bold text-indigo-700"><?= htmlspecialchars($rp['supplier_name']) ?></td>
+                                <td class="py-3 px-2"><span class="bg-slate-100 px-2 py-1 rounded text-xs border border-slate-200 font-bold"><?= htmlspecialchars($rp['crop_name']) ?></span></td>
+                                <td class="py-3 px-2 font-mono text-amber-600 font-bold"><?= number_format($rp['net_weight'], 2) ?> كجم</td>
+                                <td class="py-3 px-2 font-bold font-mono"><?= number_format($rp['total_amount']) ?></td>
+                            </tr>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+                    </tbody>
+                </table>
+            </div>
+            
+            <!-- مصاريف تشغيلية مقسمة -->
+            <h4 class="text-sm font-bold text-slate-500 mt-8 mb-3 border-t pt-6">تفصيل مصاريف التشغيل للـتاريخ</h4>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div class="p-4 border border-slate-100 bg-slate-50 rounded-2xl text-center relative overflow-hidden group">
+                    <i class="fas fa-people-carry bg-white p-2 rounded-lg text-slate-300 absolute -top-2 -left-2 opacity-50 group-hover:text-amber-200 transition"></i>
+                    <p class="text-[10px] text-slate-400 font-black mb-1">عمالة وعتالة</p>
+                    <p class="font-black text-slate-700 text-lg font-mono"><?= number_format($cats['labor']) ?></p>
+                </div>
+                <div class="p-4 border border-slate-100 bg-slate-50 rounded-2xl text-center relative overflow-hidden group">
+                    <i class="fas fa-gas-pump bg-white p-2 rounded-lg text-slate-300 absolute -top-2 -left-2 opacity-50 group-hover:text-emerald-200 transition"></i>
+                    <p class="text-[10px] text-slate-400 font-black mb-1">وقود وجازولين</p>
+                    <p class="font-black text-slate-700 text-lg font-mono"><?= number_format($cats['fuel']) ?></p>
+                </div>
+                <div class="p-4 border border-slate-100 bg-slate-50 rounded-2xl text-center relative overflow-hidden group">
+                    <i class="fas fa-tools bg-white p-2 rounded-lg text-slate-300 absolute -top-2 -left-2 opacity-50 group-hover:text-rose-200 transition"></i>
+                    <p class="text-[10px] text-slate-400 font-black mb-1">صيانة ومعدات</p>
+                    <p class="font-black text-slate-700 text-lg font-mono"><?= number_format($cats['maintenance']) ?></p>
+                </div>
+                <div class="p-4 border border-slate-100 bg-slate-50 rounded-2xl text-center relative overflow-hidden group">
+                    <i class="fas fa-receipt bg-white p-2 rounded-lg text-slate-300 absolute -top-2 -left-2 opacity-50 group-hover:text-indigo-200 transition"></i>
+                    <p class="text-[10px] text-slate-400 font-black mb-1">نثريات تشغيلية أُخرى</p>
+                    <p class="font-black text-slate-700 text-lg font-mono"><?= number_format($cats['other']) ?></p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    function exportExcel() {
+        const date = document.getElementById('reportDate').value;
+        const type = document.getElementById('exportType').value;
+        // توجيه إلى سكريبت التصدير
+        window.location.href = `export_report.php?date=${date}&type=${type}`;
+    }
+</script>
+
+<?php require_once 'includes/footer.php'; ?>
